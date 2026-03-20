@@ -134,3 +134,86 @@ def toggle_window_state(tooltip_name):
                 except: pass
     except Exception as e:
         print(f"DEBUG: Error in toggle_window_state for {hwnd}: {e}")
+
+class BrowserTabTracker:
+    def __init__(self):
+        self.history = {} # hwnd -> (current_tab_name, previous_tab_name)
+
+    def update(self):
+        """Polls the active window and updates tab history for Chrome/Vivaldi."""
+        import win32gui
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd:
+            return
+
+        title = win32gui.GetWindowText(hwnd).lower()
+        if "chrome" not in title and "vivaldi" not in title:
+            return
+
+        try:
+            # We use uiautomation to find the selected tab
+            pythoncom.CoInitialize()
+            try:
+                browser_win = auto.ControlFromHandle(hwnd)
+                
+                # Find all TabItemControls recursively
+                tabs = []
+                def find_tabs(ctrl, depth=0):
+                    if depth > 8: return
+                    if ctrl.ControlType == auto.ControlType.TabItemControl:
+                        tabs.append(ctrl)
+                    for child in ctrl.GetChildren():
+                        find_tabs(child, depth + 1)
+                
+                find_tabs(browser_win)
+                
+                current_tab = None
+                for tab in tabs:
+                    try:
+                        if tab.GetSelectionItemPattern().IsSelected:
+                            current_tab = tab.Name
+                            break
+                    except: continue
+
+                if current_tab:
+                    prev_state = self.history.get(hwnd, (None, None))
+                    if current_tab != prev_state[0]:
+                        # Record history: (new_current, old_current)
+                        self.history[hwnd] = (current_tab, prev_state[0])
+                        print(f"DEBUG: Tab history updated for HWND {hwnd}: {current_tab} (previous: {prev_state[0]})")
+            finally:
+                pythoncom.CoUninitialize()
+        except Exception as e:
+            print(f"DEBUG: BrowserTabTracker update error: {e}")
+
+    def toggle_active_tab(self):
+        """Switches to the previous tab in the active browser window."""
+        import win32gui
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd: return
+
+        state = self.history.get(hwnd)
+        if not state or not state[1]:
+            print(f"DEBUG: No previous tab recorded for HWND {hwnd}")
+            return
+
+        previous_tab_name = state[1]
+        print(f"DEBUG: Attempting to toggle to previous tab: {previous_tab_name}")
+
+        pythoncom.CoInitialize()
+        try:
+            browser_win = auto.ControlFromHandle(hwnd)
+            target_tab = browser_win.TabItemControl(searchDepth=8, Name=previous_tab_name)
+            if target_tab.Exists(0, 0):
+                target_tab.GetSelectionItemPattern().Select()
+                return True
+            else:
+                print(f"DEBUG: Could not find tab '{previous_tab_name}' to toggle back.")
+        except Exception as e:
+            print(f"DEBUG: toggle_active_tab error: {e}")
+        finally:
+            pythoncom.CoUninitialize()
+        return False
+
+# Global instance
+browser_tracker = BrowserTabTracker()

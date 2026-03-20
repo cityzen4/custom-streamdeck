@@ -54,17 +54,36 @@ def render_key_image(deck, icon_img, label):
     
     return PILHelper.to_native_key_format(deck, image)
 
-def update_deck_buttons(deck, windows):
-    """Updates the deck buttons based on the current window list."""
+def update_deck_buttons(deck, windows, special_key_index=-1):
+    """Updates the deck buttons based on the current window list, reserving one for a special action."""
     num_keys = deck.key_count()
-    for i in range(num_keys):
-        if i < len(windows):
-            win = windows[i]
-            # We'll need a way to get the icon here, usually passed in windows list
+    
+    # Load special icon once
+    tab_icon = None
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tab_switcher_icon.png")
+    if os.path.exists(icon_path):
+        try:
+            tab_icon = Image.open(icon_path)
+        except: pass
+
+    for key_idx in range(num_keys):
+        if key_idx == special_key_index:
+            # Render the special Tab Toggle button
+            image = render_key_image(deck, tab_icon, "Tab Toggle")
+            deck.set_key_image(key_idx, image)
+            continue
+
+        # Adjust window index if we're past the special key
+        win_idx = key_idx
+        if special_key_index != -1 and key_idx > special_key_index:
+            win_idx = key_idx - 1
+            
+        if win_idx < len(windows):
+            win = windows[win_idx]
             icon = win.get('icon')
             label = win['title'][:10] + "..." if len(win['title']) > 10 else win['title']
             image = render_key_image(deck, icon, label)
-            deck.set_key_image(i, image)
+            deck.set_key_image(key_idx, image)
         else:
             # Clear unused keys
-            deck.set_key_image(i, PILHelper.to_native_key_format(deck, PILHelper.create_key_image(deck)))
+            deck.set_key_image(key_idx, PILHelper.to_native_key_format(deck, PILHelper.create_key_image(deck)))
