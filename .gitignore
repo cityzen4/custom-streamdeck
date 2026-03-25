@@ -3,3 +3,16 @@ __pycache__/
 *.pyc
 .idea/
 .vscode/
+
+# Stream Deck specific ignores
+streamdeck.log
+streamdeck.pid
+*_out.txt
+output.txt
+@AutomationLog.txt
+test_mutex.py
+test_filter.py
+list_decks.py
+tmp/
+# Ignore browser recording/artifacts
+C:\Users\Jack Kelley\.gemini\antigravity\brain\

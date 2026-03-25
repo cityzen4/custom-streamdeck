@@ -74,6 +74,8 @@ update_lock = threading.Lock()
 should_exit = False
 deck_obj = None
 LOWER_LEFT_INDEX = -1
+RESET_DECK_INDEX = -1
+MAX_WINDOW_KEYS = -1
 
 # ── Tray icon ──
 def on_quit(icon, item):
@@ -82,16 +84,19 @@ def on_quit(icon, item):
     should_exit = True
     icon.stop()
 
+def restart_app():
+    print("Restarting app completely...")
+    global should_exit
+    should_exit = True
+    release_single_instance()
+    vbs_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_streamdeck_invisible.vbs")
+    os.startfile(vbs_path)
+    os._exit(0)
+
 def on_reset(icon, item):
-    global current_windows, deck_obj
-    print("Resetting StreamDeck from tray...")
-    with update_lock:
-        try:
-            if deck_obj:
-                deck_obj.reset()
-                current_windows = []
-        except Exception as e:
-            print(f"Error resetting deck: {e}")
+    print("Resetting StreamDeck from tray (now restarting app)...")
+    icon.stop()
+    restart_app()
 
 def setup_tray():
     icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
@@ -110,6 +115,13 @@ def setup_tray():
 # ── Refresh loop ──
 def refresh_loop(deck):
     global current_windows, should_exit
+    
+    # Force initial update
+    new_windows = get_open_windows()
+    with update_lock:
+        current_windows = new_windows
+        update_deck_buttons(deck, current_windows, LOWER_LEFT_INDEX, RESET_DECK_INDEX, MAX_WINDOW_KEYS)
+
     while not should_exit:
         try:
             new_windows = get_open_windows()
@@ -125,11 +137,8 @@ def refresh_loop(deck):
                             break
 
                 if changed:
-                    for w in new_windows:
-                        if 'name' in w and 'title' not in w:
-                            w['title'] = w['name']
                     current_windows = new_windows
-                    update_deck_buttons(deck, current_windows, LOWER_LEFT_INDEX)
+                    update_deck_buttons(deck, current_windows, LOWER_LEFT_INDEX, RESET_DECK_INDEX, MAX_WINDOW_KEYS)
 
         except Exception as e:
             print(f"Error in refresh loop: {e}")
@@ -140,35 +149,54 @@ def refresh_loop(deck):
 
 # ── Key callback ──
 def key_change_callback(deck, key, state):
-    pythoncom.CoInitialize()
-    try:
-        global current_windows, LOWER_LEFT_INDEX
-        if state:  # Key pressed
+    if not state:
+        return
+
+    def action():
+        pythoncom.CoInitialize()
+        try:
+            global current_windows, LOWER_LEFT_INDEX, RESET_DECK_INDEX, MAX_WINDOW_KEYS
             if key == LOWER_LEFT_INDEX:
                 print("Special Key: Browser Tab Toggle")
                 browser_tracker.toggle_active_tab()
                 return
+            if key == RESET_DECK_INDEX:
+                print("Special Key: Reset App")
+                restart_app()
+                return
 
+            target_title = None
             with update_lock:
-                win_idx = key
-                if LOWER_LEFT_INDEX != -1 and key > LOWER_LEFT_INDEX:
-                    win_idx = key - 1
+                if key < MAX_WINDOW_KEYS:
+                    win_idx = key
+                    if win_idx < len(current_windows):
+                        win = current_windows[win_idx]
+                        target_title = win.get('title', win.get('name'))
 
-                if win_idx < len(current_windows):
-                    win = current_windows[win_idx]
-                    print(f"Toggling window: {win.get('title', win.get('name', 'Unknown'))}")
-                    try:
-                        toggle_window_state(win.get('title', win.get('name')))
-                    except Exception as e:
-                        print(f"Error toggling window: {e}")
-    finally:
-        pythoncom.CoUninitialize()
+            if target_title:
+                print(f"Toggling window: {target_title}")
+                try:
+                    toggle_window_state(target_title)
+                except Exception as e:
+                    print(f"Error toggling window: {e}")
+        finally:
+            pythoncom.CoUninitialize()
+
+    threading.Thread(target=action, daemon=True).start()
 
 # ── Main ──
 if __name__ == "__main__":
     if not acquire_single_instance():
         print("StreamDeck Switcher is already running. Exiting.")
         sys.exit(0)
+
+    # Write PID to file for auto-reboot script
+    try:
+        pid_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "streamdeck.pid")
+        with open(pid_path, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        print(f"Failed to write PID file: {e}")
 
     threading.Thread(target=setup_tray, daemon=True).start()
 
@@ -177,24 +205,24 @@ if __name__ == "__main__":
             deck_obj = None
             current_windows = []
             
-            print("Waiting for StreamDeck...")
+            print("Waiting for Stream Deck XL...")
             while not should_exit:
                 try:
-                    from StreamDeck.DeviceManager import DeviceManager
-                    decks = DeviceManager().enumerate()
-                    if decks:
-                        deck_obj = decks[0]
-                        deck_obj.open()
-                        deck_obj.reset()
+                    # Specific filter for XL to avoid conflicts with Neo/others
+                    deck_obj = get_deck(model_filter="Stream Deck XL")
+                    if deck_obj:
                         break
-                except Exception: pass
+                except Exception as e:
+                    print(f"Error finding deck: {e}")
                 time.sleep(3)
 
             if should_exit: break
 
             rows, cols = deck_obj.key_layout()
             LOWER_LEFT_INDEX = (rows - 1) * cols
-            print(f"Connected. Lower-left index: {LOWER_LEFT_INDEX}")
+            RESET_DECK_INDEX = rows * cols - 1
+            MAX_WINDOW_KEYS = 3 * cols
+            print(f"Connected. Lower-left index: {LOWER_LEFT_INDEX}, Reset index: {RESET_DECK_INDEX}, Max windows: {MAX_WINDOW_KEYS}")
             
             deck_obj.set_key_callback(key_change_callback)
             refresh_loop(deck_obj)

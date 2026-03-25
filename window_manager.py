@@ -1,6 +1,10 @@
 import time
 import uiautomation as auto
 from PIL import ImageGrab
+import pythoncom
+import win32gui
+import win32con
+import win32api
 
 def is_valid_app_button(elem):
     """Filters out known system tray buttons and non-app items."""
@@ -44,6 +48,7 @@ def get_taskbar_buttons(elem, buttons_list):
             
             buttons_list.append({
                 'name': elem.Name,
+                'title': elem.Name,
                 'uia_control': elem,
                 'icon': icon_img
             })
@@ -54,7 +59,6 @@ def get_taskbar_buttons(elem, buttons_list):
 
 def get_open_windows():
     """Returns a list of dictionaries representing the exact taskbar items from all taskbars."""
-    import pythoncom
     pythoncom.CoInitialize()
     
     buttons = []
@@ -82,9 +86,17 @@ def get_open_windows():
     finally:
         pythoncom.CoUninitialize()
 
+_HWND_CACHE = {} # tooltip -> hwnd
+
 def find_hwnd_by_tooltip(tooltip):
     """Finds the HWND of a window whose title matches the taskbar tooltip."""
-    import win32gui
+    # Check cache first
+    cached_hwnd = _HWND_CACHE.get(tooltip)
+    if cached_hwnd and win32gui.IsWindow(cached_hwnd) and win32gui.IsWindowVisible(cached_hwnd):
+        title = win32gui.GetWindowText(cached_hwnd)
+        if title and (title in tooltip or tooltip.startswith(title) or title.startswith(tooltip)):
+            return cached_hwnd
+
     matched_hwnds = []
     def callback(hwnd, extra):
         if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
@@ -92,15 +104,19 @@ def find_hwnd_by_tooltip(tooltip):
             # Match if the window title is in the tooltip or the tooltip is in the window title
             if title in tooltip or tooltip.startswith(title) or title.startswith(tooltip):
                 matched_hwnds.append(hwnd)
+    
     win32gui.EnumWindows(callback, None)
-    # If multiple matched, return the first one (often the most recently used/z-ordered)
-    return matched_hwnds[0] if matched_hwnds else None
+    
+    if matched_hwnds:
+        # If multiple matched, return the first one (often the most recently used/z-ordered)
+        hwnd = matched_hwnds[0]
+        _HWND_CACHE[tooltip] = hwnd
+        return hwnd
+    
+    return None
 
 def toggle_window_state(tooltip_name):
     """Restores original win32gui non-mouse-modifying toggle behavior."""
-    import win32gui
-    import win32con
-    
     hwnd = find_hwnd_by_tooltip(tooltip_name)
     if not hwnd or not win32gui.IsWindow(hwnd):
         print(f"DEBUG: Could not find valid HWND for tooltip: {tooltip_name}")
@@ -119,14 +135,16 @@ def toggle_window_state(tooltip_name):
             if state == win32con.SW_SHOWMINIMIZED:
                 win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
             
+            # Show and bring to front
             win32gui.ShowWindow(hwnd, win32con.SW_SHOWMAXIMIZED)
             
-            # Force focus
+            # Robust focus
             try:
-                import win32api
+                # Alt-key tap to bypass focus restrictions
                 win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
                 win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
                 win32gui.SetForegroundWindow(hwnd)
+                win32gui.BringWindowToTop(hwnd)
             except Exception as e:
                 print(f"DEBUG: Focus error: {e}")
                 try:
@@ -141,7 +159,6 @@ class BrowserTabTracker:
 
     def update(self):
         """Polls the active window and updates tab history for Chrome/Vivaldi."""
-        import win32gui
         hwnd = win32gui.GetForegroundWindow()
         if not hwnd:
             return
@@ -188,7 +205,6 @@ class BrowserTabTracker:
 
     def toggle_active_tab(self):
         """Switches to the previous tab in the active browser window."""
-        import win32gui
         hwnd = win32gui.GetForegroundWindow()
         if not hwnd: return
 
