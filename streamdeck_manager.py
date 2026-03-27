@@ -1,3 +1,8 @@
+import os
+from StreamDeck.DeviceManager import DeviceManager
+from StreamDeck.ImageHelpers import PILHelper
+from PIL import Image, ImageDraw, ImageFont
+
 # Global cache for performance
 _RESOURCE_CACHE = {
     'font': None,
