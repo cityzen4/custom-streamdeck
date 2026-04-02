@@ -12,6 +12,10 @@ from PIL import Image
 import pythoncom
 import logging
 import datetime
+import json
+import win32gui
+import win32con
+from window_manager import _HIDDEN_TRAY_WINDOWS, find_hwnd_by_tooltip
 
 # ── Logging Setup ──
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "streamdeck.log")
@@ -147,6 +151,74 @@ def refresh_loop(deck):
         browser_tracker.update()
         time.sleep(1)
 
+def tray_monitor_loop():
+    global should_exit, current_windows
+    previous_placements = {}
+    
+    while not should_exit:
+        try:
+            config_path = r'c:\projects\commander\config.json'
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                tray_windows = config.get('tray_windows', [])
+                for target_rule in tray_windows:
+                    clean_rule = target_rule.strip('"').strip("'")
+                    matched_hwnds = []
+                    win32gui.EnumWindows(lambda h, extra: matched_hwnds.append(h) if win32gui.IsWindowVisible(h) and win32gui.GetWindowText(h) and clean_rule in win32gui.GetWindowText(h) else None, None)
+                    
+                    for hwnd in matched_hwnds:
+                        actual_title = win32gui.GetWindowText(hwnd)
+                        placement = win32gui.GetWindowPlacement(hwnd)[1]
+                        prev_placement = previous_placements.get(hwnd)
+                        
+                        if placement == win32con.SW_SHOWMINIMIZED and prev_placement != win32con.SW_SHOWMINIMIZED and prev_placement is not None:
+                            print(f"Detected flagged window minimized: {actual_title} ({hwnd}) matching rule: {clean_rule}")
+                            
+                            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+                            
+                            icon_image = None
+                            for w in current_windows:
+                                if w.get('name') == actual_title or w.get('title') == actual_title:
+                                    if w.get('icon'):
+                                        icon_image = w['icon']
+                                    break
+                            
+                            if not icon_image:
+                                try:
+                                    icon_image = Image.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico"))
+                                except:
+                                    icon_image = Image.new('RGB', (64, 64), color=(0, 120, 215))
+
+                            def create_restore_func(t_arg):
+                                def on_restore(icon, item):
+                                    toggle_window_state(t_arg)
+                                return on_restore
+
+                            menu = pystray.Menu(
+                                pystray.MenuItem('Restore Window', create_restore_func(actual_title), default=True)
+                            )
+                            tray = pystray.Icon(f"hidden_{hwnd}", icon_image, actual_title, menu)
+                            
+                            import window_manager
+                            window_manager._HIDDEN_TRAY_WINDOWS.append({
+                                'name': actual_title,
+                                'title': actual_title,
+                                'hwnd': hwnd,
+                                'icon': icon_image,
+                                'tray_icon': tray
+                            })
+                            
+                            threading.Thread(target=tray.run, daemon=True).start()
+                            
+                        # Update previous placement
+                        if win32gui.IsWindowVisible(hwnd):
+                            previous_placements[hwnd] = placement
+                            
+        except Exception as e:
+            pass # ignore transient reading errors
+        time.sleep(1.5)
+
 # ── Key callback ──
 def key_change_callback(deck, key, state):
     if not state:
@@ -199,6 +271,7 @@ if __name__ == "__main__":
         print(f"Failed to write PID file: {e}")
 
     threading.Thread(target=setup_tray, daemon=True).start()
+    threading.Thread(target=tray_monitor_loop, daemon=True).start()
 
     try:
         while not should_exit:

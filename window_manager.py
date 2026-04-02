@@ -57,6 +57,8 @@ def get_taskbar_buttons(elem, buttons_list):
     for child in elem.GetChildren():
         get_taskbar_buttons(child, buttons_list)
 
+_HIDDEN_TRAY_WINDOWS = []
+
 def get_open_windows():
     """Returns a list of dictionaries representing the exact taskbar items from all taskbars."""
     pythoncom.CoInitialize()
@@ -81,6 +83,16 @@ def get_open_windows():
         # Extract buttons in the correct physical order
         for tb in taskbars:
             get_taskbar_buttons(tb, buttons)
+
+        # Inject hidden tray windows so Stream Deck retains their buttons
+        for hidden in _HIDDEN_TRAY_WINDOWS:
+            # Reconstruct the expected dict structure
+            buttons.append({
+                'name': hidden['name'],
+                'title': hidden['title'],
+                'uia_control': None,
+                'icon': hidden['icon']
+            })
 
         return buttons
     finally:
@@ -117,6 +129,28 @@ def find_hwnd_by_tooltip(tooltip):
 
 def toggle_window_state(tooltip_name):
     """Restores original win32gui non-mouse-modifying toggle behavior."""
+    
+    # Check if it's a hidden tray window first
+    global _HIDDEN_TRAY_WINDOWS
+    for hw in _HIDDEN_TRAY_WINDOWS:
+        if hw['title'] == tooltip_name or hw['name'] == tooltip_name:
+            hwnd = hw['hwnd']
+            print(f"DEBUG: Restoring hidden tray window {hwnd}")
+            if hw.get('tray_icon'):
+                try: hw['tray_icon'].stop()
+                except: pass
+            
+            _HIDDEN_TRAY_WINDOWS = [x for x in _HIDDEN_TRAY_WINDOWS if x['hwnd'] != hwnd]
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            try:
+                win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+                win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+                win32gui.SetForegroundWindow(hwnd)
+                win32gui.BringWindowToTop(hwnd)
+            except: pass
+            return
+
     hwnd = find_hwnd_by_tooltip(tooltip_name)
     if not hwnd or not win32gui.IsWindow(hwnd):
         print(f"DEBUG: Could not find valid HWND for tooltip: {tooltip_name}")
