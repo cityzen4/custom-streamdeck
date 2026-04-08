@@ -15,6 +15,7 @@ import datetime
 import json
 import win32gui
 import win32con
+import win32ui
 from window_manager import _HIDDEN_TRAY_WINDOWS, find_hwnd_by_tooltip
 
 # ── Logging Setup ──
@@ -80,6 +81,121 @@ deck_obj = None
 LOWER_LEFT_INDEX = -1
 RESET_DECK_INDEX = -1
 MAX_WINDOW_KEYS = -1
+
+# ── Extract real window icon from HWND ──
+GCL_HICON = -14
+GCL_HICONSM = -34
+
+def _hicon_to_pil(hicon, size=32):
+    """Convert a Win32 HICON handle to a PIL RGBA Image."""
+    try:
+        hdc = win32ui.CreateDCFromHandle(win32gui.GetDC(0))
+        hbmp = win32ui.CreateBitmap()
+        hbmp.CreateCompatibleBitmap(hdc, size, size)
+        hdc_mem = hdc.CreateCompatibleDC()
+        hdc_mem.SelectObject(hbmp)
+
+        brush = win32gui.CreateSolidBrush(0)
+        win32gui.FillRect(hdc_mem.GetSafeHdc(), (0, 0, size, size), brush)
+        win32gui.DeleteObject(brush)
+
+        win32gui.DrawIconEx(hdc_mem.GetSafeHdc(), 0, 0, hicon, size, size, 0, 0, 0x0003)  # DI_NORMAL
+
+        bmpinfo = hbmp.GetInfo()
+        bmpstr = hbmp.GetBitmapBits(True)
+        img = Image.frombuffer('RGBA', (bmpinfo['bmWidth'], bmpinfo['bmHeight']), bmpstr, 'raw', 'BGRA', 0, 1)
+
+        hdc_mem.DeleteDC()
+        win32gui.ReleaseDC(0, hdc.GetSafeHdc())
+        win32gui.DeleteObject(hbmp.GetHandle())
+
+        return img
+    except Exception as e:
+        print(f"DEBUG: _hicon_to_pil failed: {e}")
+        return None
+
+def _get_exe_path_from_hwnd(hwnd):
+    """Get the executable path for the process that owns a window handle."""
+    try:
+        import win32process
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        import psutil
+        proc = psutil.Process(pid)
+        return proc.exe()
+    except Exception:
+        pass
+    # Fallback: QueryFullProcessImageNameW via ctypes
+    try:
+        import win32process
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            try:
+                buf = ctypes.create_unicode_buffer(512)
+                buf_size = ctypes.c_uint32(512)
+                if ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(buf_size)):
+                    return buf.value
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    return None
+
+def get_window_icon(hwnd, size=32):
+    """Extract the actual app icon from a window handle and return as a PIL Image.
+    Strategy chain:
+      1. WM_GETICON (SMALL2 -> SMALL -> BIG)
+      2. GetClassLongPtrW (HICONSM -> HICON)
+      3. ExtractIconEx from the process .exe
+      4. Falls back to None (caller uses app_icon.ico)
+    """
+    # ── Strategy 1 & 2: Window message / class icon ──
+    hicon = None
+    try:
+        hicon = win32gui.SendMessage(hwnd, win32con.WM_GETICON, win32con.ICON_SMALL2, 0)
+        if not hicon:
+            hicon = win32gui.SendMessage(hwnd, win32con.WM_GETICON, win32con.ICON_SMALL, 0)
+        if not hicon:
+            hicon = win32gui.SendMessage(hwnd, win32con.WM_GETICON, win32con.ICON_BIG, 0)
+        if not hicon:
+            hicon = ctypes.windll.user32.GetClassLongPtrW(hwnd, GCL_HICONSM)
+        if not hicon:
+            hicon = ctypes.windll.user32.GetClassLongPtrW(hwnd, GCL_HICON)
+    except Exception:
+        pass
+
+    if hicon:
+        img = _hicon_to_pil(hicon, size)
+        if img:
+            return img
+
+    # ── Strategy 3: Extract icon from executable file ──
+    exe_path = _get_exe_path_from_hwnd(hwnd)
+    if exe_path:
+        try:
+            large_icons, small_icons = win32gui.ExtractIconEx(exe_path, 0, 1)
+            # Prefer small icon for systray, fall back to large
+            icons_to_try = (small_icons or []) + (large_icons or [])
+            for ico_handle in icons_to_try:
+                if ico_handle:
+                    img = _hicon_to_pil(ico_handle, size)
+                    # Clean up all extracted icon handles
+                    for h in (large_icons or []) + (small_icons or []):
+                        if h:
+                            win32gui.DestroyIcon(h)
+                    if img:
+                        print(f"DEBUG: Got icon from exe for hwnd {hwnd}: {exe_path}")
+                        return img
+            # Cleanup if no icon worked
+            for h in (large_icons or []) + (small_icons or []):
+                if h:
+                    win32gui.DestroyIcon(h)
+        except Exception as e:
+            print(f"DEBUG: ExtractIconEx failed for {exe_path}: {e}")
+
+    print(f"DEBUG: No icon found for hwnd {hwnd}, falling back to default")
+    return None
 
 # ── Tray icon ──
 def on_quit(icon, item):
@@ -175,14 +291,29 @@ def tray_monitor_loop():
                         if placement == win32con.SW_SHOWMINIMIZED and prev_placement != win32con.SW_SHOWMINIMIZED and prev_placement is not None:
                             print(f"Detected flagged window minimized: {actual_title} ({hwnd}) matching rule: {clean_rule}")
                             
-                            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
-                            
+                            # Strategy 1: Use the taskbar screenshot icon from current_windows
+                            # This captures the EXACT icon shown in the taskbar (including
+                            # dynamic favicons for web apps like SLAI in Chrome)
                             icon_image = None
-                            for w in current_windows:
-                                if w.get('name') == actual_title or w.get('title') == actual_title:
-                                    if w.get('icon'):
-                                        icon_image = w['icon']
-                                    break
+                            with update_lock:
+                                for w in current_windows:
+                                    w_name = w.get('name', '')
+                                    w_title = w.get('title', '')
+                                    # Substring match (same logic as tray_windows rules)
+                                    if (actual_title in w_name or w_name in actual_title or
+                                        actual_title in w_title or w_title in actual_title or
+                                        clean_rule in w_name or clean_rule in w_title):
+                                        if w.get('icon'):
+                                            icon_image = w['icon']
+                                            print(f"DEBUG: Using taskbar screenshot icon for: {actual_title}")
+                                            break
+                            
+                            # Strategy 2: Extract the real window icon via Win32 HICON
+                            # (before hiding, so the handle is still valid)
+                            if not icon_image:
+                                icon_image = get_window_icon(hwnd)
+                            
+                            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
                             
                             if not icon_image:
                                 try:
